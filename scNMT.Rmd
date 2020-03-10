@@ -1,0 +1,97 @@
+---
+title: Validating Joint Analysis of Single-Cell Transcriptome and Epigenome Data Using
+  scNMT-seq and SNARE-seq
+author: "Joshua Welch"
+date: "March 9, 2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## scNMT-seq
+We first read the data and create a LIGER object:
+```{r read1}
+library(Matrix)
+gene_acc = read.table("genebody_accessibility.tsv.gz",header=F)
+rna = readRDS("SingleCellExperiment-rna_matching-cells.rds")
+```
+
+Next we factorize the RNA only:
+```{r liger1}
+library(liger)
+rna_liger = createLiger(list(rna=rna@assays[["counts"]]))
+rna_liger = normalize(rna_liger)
+rna_liger = selectGenes(rna_liger,var.thresh = 1)
+rna_liger = scaleNotCenter(rna_liger)
+rna_liger = optimizeALS(rna_liger,k=20)
+```
+
+We add the chromatin accessibility data:
+```{r proj}
+genes = reshape2::acast(gene_acc,V2~V1,value.var = "V4")
+genes[is.na(genes)]=0
+good_cells = rna@colData$sample[rna@colData$sample %in% colnames(genes)]
+rna_liger@norm.data[["acc"]] = rna_liger@raw.data[["acc"]] = as.matrix(genes[,good_cells])
+rna_liger@var.genes = rna_liger@var.genes[rna_liger@var.genes %in% rownames(rna_liger@raw.data[["acc"]])]
+rna_liger@raw.data[["acc"]] = Matrix(rna_liger@raw.data[["acc"]],sparse=T)
+rna_liger = normalize(rna_liger)
+rna_liger = scaleNotCenter(rna_liger)
+W = rna_liger@W[,rna_liger@var.genes]
+rna_liger@H[["acc"]] = t(liger:::solveNNLS(t(W),t(rna_liger@scale.data[["acc"]])))
+rownames(rna_liger@H[["acc"]]) = rownames(rna_liger@scale.data[["acc"]])
+
+```
+
+We then perform quantile normalization and t-SNE:
+```{r quant}
+rna_liger = quantile_norm(rna_liger,ref_dataset = "rna")
+rna_liger = runTSNE(rna_liger)
+clusts = rna@colData$lineage
+names(clusts) = rna@colData$sample
+plotByDatasetAndCluster(rna_liger,clusters=clusts)
+```
+
+## SNARE-seq
+We first read the data (gene body/promoter accessibility for ATAC-seq, gene expression for RNA-seq):
+```{r read}
+gene_body_atac = readRDS("GSE126074_AdBrainCortex_SNAREseq_chromatin_genes.counts.RDS")
+rna = readMM("GSE126074_AdBrainCortex_SNAREseq_cDNA.counts.mtx.gz")
+rn = read.table("GSE126074_AdBrainCortex_SNAREseq_cDNA.barcodes.tsv.gz",header=F)
+rn = rn[,1]
+cn = read.table("GSE126074_AdBrainCortex_SNAREseq_cDNA.genes.tsv.gz",header=F)
+cn = cn[,1]
+colnames(rna)=paste0("rna_",rn)
+rownames(rna)=cn
+```
+We next normalize by total counts per cell, select variable genes (using RNA only), and perform iNMF:
+```{r liger}
+library(liger)
+snare_liger = createLiger(list(rna=rna,atac=gene_body_atac))
+snare_liger = normalize(snare_liger)
+snare_liger = selectGenes(snare_liger,var.thresh = 0.075,datasets.use = 1)
+snare_liger = scaleNotCenter(snare_liger)
+snare_liger = optimizeALS(snare_liger,k=30,max.iters = 30,thresh=1e-6)
+```
+Now we perform quantile normalization, t-SNE, and joint clustering.
+```{r align}
+snare_liger = quantile_norm(snare_liger,ref_dataset = "rna",k=100)
+snare_liger = runTSNE(snare_liger)
+snare_liger = louvainCluster(snare_liger,resolution=1,k=100)
+names(snare_liger@clusters)=rownames(snare_liger@H.norm)
+```
+Plotting indicates strong dataset alignment and confirms that gene body/promoter accessibility and gene expression are correlated.
+```{r plotting,echo=FALSE}
+plotByDatasetAndCluster(snare_liger)
+#Glutamatergic, IT
+plotGene(snare_liger,"Slc30a3")
+#Glutamatergic, non-IT 
+plotGene(snare_liger,"Foxp2")
+#GABAergic
+plotGene(snare_liger,"Gad2")
+#OPC
+plotGene(snare_liger,"Tnr")
+
+```
+
